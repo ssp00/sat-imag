@@ -1,0 +1,26 @@
+# Datasets
+LEVIR CD/
+LEVIR-CD/
+data/
+
+# Model Checkpoints & Large Weights (>100MB limit on GitHub)
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.ckpt
+*.h5
+
+# Outputs & Generated Artifacts
+outputs/
+*.log
+
+# Python & Jupyter cached files
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+.env

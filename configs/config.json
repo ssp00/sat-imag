@@ -1,0 +1,15 @@
+{
+    "seed": 42,
+    "use_cuda": true,
+    "dataset_dir": "d:\\vit\\SEMESTER-5\\IV\\DA\\LEVIR CD\\LEVIR CD",
+    "project_dir": "d:\\vit\\SEMESTER-5\\IV\\DA",
+    "checkpoint_dir": "d:\\vit\\SEMESTER-5\\IV\\DA\\checkpoints",
+    "pretrained": true,
+    "img_size": 224,
+    "batch_size": 4,
+    "lr": 1e-4,
+    "epochs": 5,
+    "num_workers": 0,
+    "max_train_samples": 20,
+    "max_val_samples": 5
+}
