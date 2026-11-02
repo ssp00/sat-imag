@@ -4,7 +4,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from src.dataset import LevirCDDataset
-from src.model import SwinSiameseCD, BaselineSiameseCD
+from src.model import SwinSiameseCD, BaselineSiameseCD, SiameseUNetCD, ChangeFormerCD
 from src.losses import BCEDiceLoss
 from tqdm import tqdm
 
@@ -117,10 +117,14 @@ def run_training(config):
     # Initialize model
     model_type = config['model_type'].lower()
     print(f"Initializing model '{model_type}'...")
-    if model_type == 'swin':
-        model = SwinSiameseCD(pretrained=config['pretrained'], img_size=(config['img_size'], config['img_size']))
-    elif model_type == 'baseline':
+    if model_type in ['swin', 'swin_transformer']:
+        model = SwinSiameseCD(pretrained=config.get('pretrained', True), img_size=(config['img_size'], config['img_size']))
+    elif model_type in ['baseline', 'siamese_cnn']:
         model = BaselineSiameseCD()
+    elif model_type in ['siamese_unet', 'unet']:
+        model = SiameseUNetCD()
+    elif model_type in ['changeformer']:
+        model = ChangeFormerCD()
     else:
         raise ValueError(f"Unknown model type: {model_type}")
         

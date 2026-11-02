@@ -1,9 +1,9 @@
-# Datasets
+# ── Raw Dataset (too large for GitHub) ────────────────────────────────────────
 LEVIR CD/
 LEVIR-CD/
 data/
 
-# Model Checkpoints & Large Weights (>100MB limit on GitHub)
+# ── Model Checkpoints & Large Weights (GitHub 100 MB limit) ───────────────────
 checkpoints/
 *.pth
 *.pt
@@ -11,16 +11,35 @@ checkpoints/
 *.ckpt
 *.h5
 
-# Outputs & Generated Artifacts
-outputs/
-*.log
+# ── Large Binary Outputs (keep CSVs, exclude images) ──────────────────────────
+outputs/predictions/
+outputs/xai/
+outputs/visualizations/
 
-# Python & Jupyter cached files
+# Keep these output files (small CSVs — useful for dashboard & report)
+!outputs/dashboard_data.csv
+!outputs/metrics/
+
+# ── Python Cache ───────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
 .ipynb_checkpoints/
+
+# ── Virtual Environments ───────────────────────────────────────────────────────
 .venv/
 venv/
 env/
 .env
+
+# ── OS / Editor Junk ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log

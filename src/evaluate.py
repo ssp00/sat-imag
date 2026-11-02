@@ -7,14 +7,13 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from torch.utils.data import DataLoader
 from src.dataset import LevirCDDataset
-from src.model import SwinSiameseCD, BaselineSiameseCD
-from src.losses import BCEDiceLoss
+from src.model import SwinSiameseCD, BaselineSiameseCD, SiameseUNetCD, ChangeFormerCD
 from src.train import compute_metrics
 from src.xai import SwinAttentionRollout, GradCAM, compute_xai_overlap, compute_xai_stability
 from src.visualization import plot_training_curves, plot_precision_recall_f1, plot_distributions
 
 def denormalize(tensor):
-    # Denormalize ImageNet stats
+    """Denormalize ImageNet normalized tensor back to [0, 1] RGB image."""
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     denorm = tensor * std + mean
@@ -22,33 +21,80 @@ def denormalize(tensor):
     return denorm.permute(1, 2, 0).numpy()
 
 def generate_diff_map(pred, target):
-    # pred: (H, W) binary numpy, target: (H, W) binary numpy
+    """
+    Color-coded segmentation error map:
+    Green: True Positive (TP)
+    Red: False Positive (FP)
+    Blue: False Negative (FN)
+    Dark Blue-Grey: True Negative (TN)
+    """
     H, W = pred.shape
     diff_map = np.zeros((H, W, 3), dtype=np.uint8)
-    
+
     tp = (pred == 1) & (target == 1)
     fp = (pred == 1) & (target == 0)
     fn = (pred == 0) & (target == 1)
     tn = (pred == 0) & (target == 0)
-    
-    diff_map[tp] = [46, 204, 113]   # Green (True Positive)
-    diff_map[fp] = [231, 76, 60]    # Red (False Positive)
-    diff_map[fn] = [52, 152, 219]   # Blue (False Negative)
-    diff_map[tn] = [44, 62, 80]     # Dark Blue-Grey (True Negative / Background)
-    
+
+    diff_map[tp] = [46, 204, 113]   # Green (TP)
+    diff_map[fp] = [231, 76, 60]    # Red (FP)
+    diff_map[fn] = [52, 152, 219]   # Blue (FN)
+    diff_map[tn] = [44, 62, 80]     # Dark Blue-Grey (TN)
+
     return diff_map
+
+def compute_detailed_pixel_stats(pred_tensor, target_tensor, eps=1e-7):
+    """Computes TP, TN, FP, FN, and detailed segmentation metrics for a single sample or batch."""
+    p = pred_tensor.view(-1)
+    t = target_tensor.view(-1)
+
+    tp = int((p * t).sum().item())
+    fp = int((p * (1.0 - t)).sum().item())
+    fn = int(((1.0 - p) * t).sum().item())
+    tn = int(((1.0 - p) * (1.0 - t)).sum().item())
+
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = (2.0 * precision * recall) / (precision + recall + eps)
+    iou = tp / (tp + fp + fn + eps)
+    dice = (2.0 * tp) / (2.0 * tp + fp + fn + eps)
+    accuracy = (tp + tn) / (tp + tn + fp + fn + eps)
+
+    return {
+        'TP': tp,
+        'TN': tn,
+        'FP': fp,
+        'FN': fn,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'iou': iou,
+        'dice': dice
+    }
 
 def run_evaluation():
     dataset_dir = r"d:\vit\SEMESTER-5\IV\DA\LEVIR CD\LEVIR CD"
     project_dir = r"d:\vit\SEMESTER-5\IV\DA"
     checkpoint_dir = os.path.join(project_dir, 'checkpoints')
     outputs_dir = os.path.join(project_dir, 'outputs')
-    
-    os.makedirs(os.path.join(outputs_dir, 'predictions'), exist_ok=True)
+
+    # Ensure required directory structure exists
+    model_keys = ['siamese_cnn', 'siamese_unet', 'swin', 'changeformer']
+    model_labels = {
+        'siamese_cnn': 'Siamese CNN',
+        'siamese_unet': 'Siamese U-Net',
+        'swin': 'Swin Transformer',
+        'changeformer': 'ChangeFormer'
+    }
+
+    for k in model_keys:
+        os.makedirs(os.path.join(outputs_dir, 'predictions', k), exist_ok=True)
     os.makedirs(os.path.join(outputs_dir, 'xai'), exist_ok=True)
     os.makedirs(os.path.join(outputs_dir, 'metrics'), exist_ok=True)
-    
-    # Load test set (subsampled for speed)
+    os.makedirs(os.path.join(outputs_dir, 'visualizations'), exist_ok=True)
+
+    # Load test split (5 aligned pairs)
     test_ds = LevirCDDataset(
         base_dir=dataset_dir,
         split='test',
@@ -56,305 +102,300 @@ def run_evaluation():
         max_samples=5
     )
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Evaluating on device: {device}")
-    
-    # Initialize models and load best weights
-    swin_model = SwinSiameseCD(pretrained=False, img_size=(224, 224))
-    swin_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model_swin.pth'), map_location=device))
-    swin_model.to(device)
-    swin_model.eval()
-    
-    baseline_model = BaselineSiameseCD()
-    baseline_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model_baseline.pth'), map_location=device))
-    baseline_model.to(device)
-    baseline_model.eval()
+    print(f"Evaluating 4 models on device: {device}...")
 
-    # Setup XAI
-    swin_rollout = SwinAttentionRollout(swin_model)
-    gradcam_target_swin = swin_model.dec1.conv[3] # Final conv in Swin Siamese decoder
-    gradcam_target_baseline = baseline_model.dec1.conv[3] # Final conv in CNN Baseline decoder
-    
-    gcam_swin = GradCAM(swin_model, gradcam_target_swin)
-    gcam_baseline = GradCAM(baseline_model, gradcam_target_baseline)
+    # Load 4 models
+    models = {}
 
-    swin_preds = []
-    baseline_preds = []
-    targets = []
-    filenames = []
-    
-    swin_xai_overlaps = []
-    swin_xai_stabilities = []
-    baseline_xai_overlaps = []
-    baseline_xai_stabilities = []
+    # 1. Siamese CNN
+    m_cnn = BaselineSiameseCD()
+    m_cnn.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model_baseline.pth'), map_location=device))
+    m_cnn.to(device).eval()
+    models['siamese_cnn'] = m_cnn
 
-    # Iterate over test set
-    for i, batch in enumerate(test_loader):
+    # 2. Siamese U-Net
+    m_unet = SiameseUNetCD()
+    m_unet.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model_siamese_unet.pth'), map_location=device))
+    m_unet.to(device).eval()
+    models['siamese_unet'] = m_unet
+
+    # 3. Swin Transformer
+    m_swin = SwinSiameseCD(pretrained=False, img_size=(224, 224))
+    m_swin.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model_swin.pth'), map_location=device))
+    m_swin.to(device).eval()
+    models['swin'] = m_swin
+
+    # 4. ChangeFormer
+    m_cf = ChangeFormerCD()
+    m_cf.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model_changeformer.pth'), map_location=device))
+    m_cf.to(device).eval()
+    models['changeformer'] = m_cf
+
+    # Setup XAI generators
+    swin_rollout = SwinAttentionRollout(m_swin)
+    gcam_swin = GradCAM(m_swin, m_swin.dec1.conv[3])
+    gcam_cnn = GradCAM(m_cnn, m_cnn.dec1.conv[3])
+    gcam_unet = GradCAM(m_unet, m_unet.dec1.conv[3])
+    gcam_cf = GradCAM(m_cf, m_cf.fuse_conv[0])
+
+    gcam_dict = {
+        'siamese_cnn': gcam_cnn,
+        'siamese_unet': gcam_unet,
+        'swin': gcam_swin,
+        'changeformer': gcam_cf
+    }
+
+    # Tracking containers
+    all_predictions = {k: [] for k in model_keys}
+    all_targets = []
+    all_filenames = []
+    all_xai_heatmaps = {k: [] for k in model_keys}
+    all_xai_overlaps = {k: [] for k in model_keys}
+    all_xai_stabilities = {k: [] for k in model_keys}
+
+    # Test loop
+    for batch_idx, batch in enumerate(test_loader):
         t1 = batch['t1'].to(device)
         t2 = batch['t2'].to(device)
         mask = batch['mask'].to(device)
         filename = batch['filename'][0]
-        
-        filenames.append(filename)
-        targets.append(mask.cpu())
-        
-        # 1. Swin predictions and XAI
-        with torch.enable_grad():
-            # Get Attention Rollout map
-            # Re-register Swin Rollout hooks just to be clean
-            swin_rollout.attention_maps.clear()
-            rollout_map = swin_rollout.get_rollout(t1, t2) # returns (1, 1, 224, 224)
-            
-            # Get GradCAM
-            gcam_map_swin = gcam_swin.generate_heatmap(t1, t2)
-            
-            # Compute stability on GradCAM
-            stability_swin = compute_xai_stability(swin_model, gcam_swin, t1, t2, is_swin=False)
-            
-        with torch.no_grad():
-            logits_swin = swin_model(t1, t2)
-            pred_swin = (torch.sigmoid(logits_swin) > 0.5).float().cpu()
-            swin_preds.append(pred_swin)
 
-        # 2. Baseline predictions and XAI
-        with torch.enable_grad():
-            gcam_map_baseline = gcam_baseline.generate_heatmap(t1, t2)
-            stability_baseline = compute_xai_stability(baseline_model, gcam_baseline, t1, t2, is_swin=False)
-            
-        with torch.no_grad():
-            logits_baseline = baseline_model(t1, t2)
-            pred_baseline = (torch.sigmoid(logits_baseline) > 0.5).float().cpu()
-            baseline_preds.append(pred_baseline)
+        all_filenames.append(filename)
+        all_targets.append(mask.cpu())
 
-        # Calculate XAI Overlaps
-        overlap_swin = compute_xai_overlap(gcam_map_swin[0, 0], mask[0, 0].cpu())
-        overlap_baseline = compute_xai_overlap(gcam_map_baseline[0, 0], mask[0, 0].cpu())
-        
-        swin_xai_overlaps.append(overlap_swin)
-        swin_xai_stabilities.append(stability_swin)
-        baseline_xai_overlaps.append(overlap_baseline)
-        baseline_xai_stabilities.append(stability_baseline)
-
-        # Generate prediction and XAI visualizations for InfoVis
         t1_np = denormalize(batch['t1'][0])
         t2_np = denormalize(batch['t2'][0])
-        gt_np = mask[0, 0].cpu().numpy()
-        pred_swin_np = pred_swin[0, 0].numpy()
-        pred_base_np = pred_baseline[0, 0].numpy()
+        gt_np = mask[0, 0].cpu().numpy().astype(np.uint8)
 
-        diff_swin = generate_diff_map(pred_swin_np, gt_np)
-        diff_base = generate_diff_map(pred_base_np, gt_np)
+        sample_preds_np = {}
 
-        # Calculate mask change percentages
-        gt_change_pct = (gt_np.sum() / gt_np.size) * 100.0
-        swin_change_pct = (pred_swin_np.sum() / pred_swin_np.size) * 100.0
-        base_change_pct = (pred_base_np.sum() / pred_base_np.size) * 100.0
+        # Evaluate each model on this sample
+        for m_key in model_keys:
+            model = models[m_key]
 
-        # Save Aligned Predictions Grid (T1 | T2 | GT | Prediction | Diff Map)
-        fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-        
-        # Row 1: Swin Transformer
+            # Forward pass
+            with torch.no_grad():
+                logits = model(t1, t2)
+                pred = (torch.sigmoid(logits) > 0.5).float().cpu()
+                all_predictions[m_key].append(pred)
+                pred_np = pred[0, 0].numpy().astype(np.uint8)
+                sample_preds_np[m_key] = pred_np
+
+            # Save individual binary mask PNG
+            pred_mask_img = Image.fromarray(pred_np * 255)
+            mask_out_path = os.path.join(outputs_dir, 'predictions', m_key, filename)
+            pred_mask_img.save(mask_out_path)
+
+            # XAI Heatmap & Metrics
+            with torch.enable_grad():
+                gcam_gen = gcam_dict[m_key]
+                heatmap = gcam_gen.generate_heatmap(t1, t2)
+                stability = compute_xai_stability(model, gcam_gen, t1, t2, is_swin=False)
+
+            overlap = compute_xai_overlap(heatmap[0, 0], mask[0, 0].cpu())
+            all_xai_heatmaps[m_key].append(heatmap[0, 0].numpy())
+            all_xai_overlaps[m_key].append(overlap)
+            all_xai_stabilities[m_key].append(stability)
+
+        # Swin Attention Rollout (dedicated XAI for Swin Transformer)
+        with torch.enable_grad():
+            swin_rollout.attention_maps.clear()
+            rollout_map = swin_rollout.get_rollout(t1, t2)[0, 0].numpy()
+            rollout_norm = (rollout_map - rollout_map.min()) / (rollout_map.max() - rollout_map.min() + 1e-8)
+
+        # Generate 4-Model Side-by-Side Comparison Plot for this sample
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+
+        # Row 1: Inputs, GT, and Color Legend
         axes[0, 0].imshow(t1_np)
-        axes[0, 0].set_title("T1 / Earlier")
+        axes[0, 0].set_title(f"T1 / Earlier Image\n({filename})", fontsize=11, fontweight='bold')
         axes[0, 0].axis('off')
-        
+
         axes[0, 1].imshow(t2_np)
-        axes[0, 1].set_title("T2 / Later")
+        axes[0, 1].set_title(f"T2 / Later Image\n({filename})", fontsize=11, fontweight='bold')
         axes[0, 1].axis('off')
-        
+
+        gt_pct = (gt_np.sum() / gt_np.size) * 100.0
         axes[0, 2].imshow(gt_np, cmap='gray')
-        axes[0, 2].set_title(f"GT Mask ({gt_change_pct:.2f}% change)")
+        axes[0, 2].set_title(f"Ground Truth Mask\n({gt_pct:.2f}% changed)", fontsize=11, fontweight='bold')
         axes[0, 2].axis('off')
-        
-        axes[0, 3].imshow(pred_swin_np, cmap='gray')
-        axes[0, 3].set_title(f"Swin Pred ({swin_change_pct:.2f}% change)")
+
+        # Swin Attention Rollout
+        axes[0, 3].imshow(t2_np)
+        axes[0, 3].imshow(rollout_norm, cmap='jet', alpha=0.55)
+        axes[0, 3].set_title("Swin Attention Rollout (XAI)", fontsize=11, fontweight='bold')
         axes[0, 3].axis('off')
-        
-        axes[0, 4].imshow(diff_swin)
-        axes[0, 4].set_title("Swin Diff Map\n(Green=TP, Red=FP, Blue=FN)")
-        axes[0, 4].axis('off')
-        
-        # Row 2: CNN Baseline
-        axes[1, 0].imshow(t1_np)
-        axes[1, 0].set_title("T1 / Earlier")
-        axes[1, 0].axis('off')
-        
-        axes[1, 1].imshow(t2_np)
-        axes[1, 1].set_title("T2 / Later")
-        axes[1, 1].axis('off')
-        
-        axes[1, 2].imshow(gt_np, cmap='gray')
-        axes[1, 2].set_title(f"GT Mask ({gt_change_pct:.2f}% change)")
-        axes[1, 2].axis('off')
-        
-        axes[1, 3].imshow(pred_base_np, cmap='gray')
-        axes[1, 3].set_title(f"Baseline Pred ({base_change_pct:.2f}% change)")
-        axes[1, 3].axis('off')
-        
-        axes[1, 4].imshow(diff_base)
-        axes[1, 4].set_title("Baseline Diff Map\n(Green=TP, Red=FP, Blue=FN)")
-        axes[1, 4].axis('off')
-        
-        plt.suptitle(f"Change Detection Aligned Visual Comparison: {filename}", fontsize=16, fontweight='bold')
+
+        # Row 2: Predictions for all 4 models
+        for idx, m_key in enumerate(model_keys):
+            p_np = sample_preds_np[m_key]
+            diff = generate_diff_map(p_np, gt_np)
+            p_pct = (p_np.sum() / p_np.size) * 100.0
+            p_f1 = compute_metrics(torch.tensor(p_np), torch.tensor(gt_np))['f1']
+
+            axes[1, idx].imshow(diff)
+            axes[1, idx].set_title(f"{model_labels[m_key]}\nChange: {p_pct:.2f}% | F1: {p_f1:.3f}\n(Green=TP, Red=FP, Blue=FN)",
+                                   fontsize=10, fontweight='bold')
+            axes[1, idx].axis('off')
+
+        plt.suptitle(f"4-Model Aligned Benchmark Comparison: {filename}", fontsize=15, fontweight='bold')
         plt.tight_layout()
-        plt.savefig(os.path.join(outputs_dir, 'predictions', f"pred_compare_{filename}"), dpi=150)
+        plt.savefig(os.path.join(outputs_dir, 'predictions', f"multi_compare_{filename}"), dpi=150)
+        plt.savefig(os.path.join(outputs_dir, 'predictions', f"pred_compare_{filename}"), dpi=150) # backwards compatibility
         plt.close()
 
-        # Save Aligned XAI Grid (T1 | T2 | Prediction | Swin Attention Rollout | Swin Grad-CAM | Baseline Grad-CAM)
-        fig, axes = plt.subplots(1, 6, figsize=(22, 4.5))
-        axes[0].imshow(t1_np)
-        axes[0].set_title("T1 / Earlier")
-        axes[0].axis('off')
-        
-        axes[1].imshow(t2_np)
-        axes[1].set_title("T2 / Later")
-        axes[1].axis('off')
-        
-        axes[2].imshow(gt_np, cmap='gray')
-        axes[2].set_title("Ground Truth Mask")
-        axes[2].axis('off')
-        
-        # Swin Attention Rollout heatmap
-        rollout_np = rollout_map[0, 0].numpy()
-        # Normalize
-        rollout_np = (rollout_np - rollout_np.min()) / (rollout_np.max() - rollout_np.min() + 1e-8)
-        axes[3].imshow(t2_np)
-        axes[3].imshow(rollout_np, cmap='jet', alpha=0.5)
-        axes[3].set_title("Swin Attn Rollout")
-        axes[3].axis('off')
-        
-        # Swin Grad-CAM heatmap
-        gcam_swin_np = gcam_map_swin[0, 0].numpy()
-        axes[4].imshow(t2_np)
-        axes[4].imshow(gcam_swin_np, cmap='jet', alpha=0.5)
-        axes[4].set_title(f"Swin Grad-CAM\n(Overlap IoU: {overlap_swin:.2f})")
-        axes[4].axis('off')
-        
-        # Baseline Grad-CAM heatmap
-        gcam_base_np = gcam_map_baseline[0, 0].numpy()
-        axes[5].imshow(t2_np)
-        axes[5].imshow(gcam_base_np, cmap='jet', alpha=0.5)
-        axes[5].set_title(f"Baseline Grad-CAM\n(Overlap IoU: {overlap_baseline:.2f})")
-        axes[5].axis('off')
+        # Save Aligned XAI multi-grid
+        fig_xai, axes_xai = plt.subplots(1, 6, figsize=(22, 4.5))
+        axes_xai[0].imshow(t1_np); axes_xai[0].set_title("T1 Image"); axes_xai[0].axis('off')
+        axes_xai[1].imshow(t2_np); axes_xai[1].set_title("T2 Image"); axes_xai[1].axis('off')
+        axes_xai[2].imshow(gt_np, cmap='gray'); axes_xai[2].set_title("Ground Truth"); axes_xai[2].axis('off')
 
-        plt.suptitle(f"Explainable AI Diagnostic Visualizations: {filename}", fontsize=15, fontweight='bold')
+        # Swin Rollout
+        axes_xai[3].imshow(t2_np)
+        axes_xai[3].imshow(rollout_norm, cmap='jet', alpha=0.55)
+        axes_xai[3].set_title("Swin Attn Rollout"); axes_xai[3].axis('off')
+
+        # Swin Grad-CAM
+        axes_xai[4].imshow(t2_np)
+        axes_xai[4].imshow(all_xai_heatmaps['swin'][-1], cmap='jet', alpha=0.55)
+        axes_xai[4].set_title(f"Swin Grad-CAM (IoU: {all_xai_overlaps['swin'][-1]:.2f})"); axes_xai[4].axis('off')
+
+        # ChangeFormer Grad-CAM
+        axes_xai[5].imshow(t2_np)
+        axes_xai[5].imshow(all_xai_heatmaps['changeformer'][-1], cmap='jet', alpha=0.55)
+        axes_xai[5].set_title(f"ChangeFormer CAM (IoU: {all_xai_overlaps['changeformer'][-1]:.2f})"); axes_xai[5].axis('off')
+
+        plt.suptitle(f"Explainable AI Heatmap Diagnostics: {filename}", fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.savefig(os.path.join(outputs_dir, 'xai', f"xai_{filename}"), dpi=150)
         plt.close()
 
-    # Clean up XAI hooks
+    # Clean up hooks
     swin_rollout.remove_hooks()
-    gcam_swin.remove_hooks()
-    gcam_baseline.remove_hooks()
+    for gcam in gcam_dict.values():
+        gcam.remove_hooks()
 
-    # Concatenate predictions for global evaluation metrics
-    all_swin_preds = torch.cat(swin_preds, dim=0)
-    all_base_preds = torch.cat(baseline_preds, dim=0)
-    all_targets = torch.cat(targets, dim=0)
+    # Global multi-model test metrics
+    global_targets = torch.cat(all_targets, dim=0)
+    final_test_report = {}
+    individual_model_dfs = {}
 
-    metrics_swin = compute_metrics(all_swin_preds, all_targets)
-    metrics_base = compute_metrics(all_base_preds, all_targets)
+    print("\n=======================================================")
+    print("FINAL 4-MODEL EVALUATION BENCHMARK ON TEST SET")
+    print("=======================================================")
+    print(f"{'Model':<20} | {'Accuracy':<9} | {'Precision':<9} | {'Recall':<9} | {'F1':<9} | {'IoU':<9} | {'Dice':<9}")
+    print("-" * 80)
 
-    # Print Report
-    print("\n=========================================")
-    print("FINAL EVALUATION REPORT ON TEST SET")
-    print("=========================================")
-    print(f"Model: Siamese Swin Transformer")
-    print(f"Test samples: {len(test_loader)}")
-    print(f"Accuracy:  {metrics_swin['accuracy']:.4f}")
-    print(f"Precision: {metrics_swin['precision']:.4f}")
-    print(f"Recall:    {metrics_swin['recall']:.4f}")
-    print(f"F1-score:  {metrics_swin['f1']:.4f}")
-    print(f"IoU:       {metrics_swin['iou']:.4f}")
-    print(f"Dice:      {metrics_swin['dice']:.4f}")
-    
-    print("\n-----------------------------------------")
-    print(f"Model: Siamese CNN Baseline")
-    print(f"Test samples: {len(test_loader)}")
-    print(f"Accuracy:  {metrics_base['accuracy']:.4f}")
-    print(f"Precision: {metrics_base['precision']:.4f}")
-    print(f"Recall:    {metrics_base['recall']:.4f}")
-    print(f"F1-score:  {metrics_base['f1']:.4f}")
-    print(f"IoU:       {metrics_base['iou']:.4f}")
-    print(f"Dice:      {metrics_base['dice']:.4f}")
-    print("=========================================")
+    for m_key in model_keys:
+        all_p = torch.cat(all_predictions[m_key], dim=0)
+        m_stats = compute_detailed_pixel_stats(all_p, global_targets)
+        m_label = model_labels[m_key]
 
-    # Save test metrics JSON and CSV
-    test_metrics = {
-        'Swin': {k.upper(): v for k, v in metrics_swin.items()},
-        'Baseline': {k.upper(): v for k, v in metrics_base.items()}
-    }
+        final_test_report[m_label] = {
+            'Accuracy': m_stats['accuracy'],
+            'Precision': m_stats['precision'],
+            'Recall': m_stats['recall'],
+            'F1': m_stats['f1'],
+            'IoU': m_stats['iou'],
+            'Dice': m_stats['dice']
+        }
+
+        print(f"{m_label:<20} | {m_stats['accuracy']:<9.4f} | {m_stats['precision']:<9.4f} | {m_stats['recall']:<9.4f} | {m_stats['f1']:<9.4f} | {m_stats['iou']:<9.4f} | {m_stats['dice']:<9.4f}")
+
+        # Save individual model metric CSV
+        ind_df = pd.DataFrame([m_stats])
+        ind_df.to_csv(os.path.join(outputs_dir, 'metrics', f"{m_key}_metrics.csv"), index=False)
+
+    print("=======================================================")
+
+    # Save summary test_metrics.csv and test_metrics.json
+    df_summary = pd.DataFrame(final_test_report).T
+    df_summary.to_csv(os.path.join(outputs_dir, 'metrics', 'test_metrics.csv'))
     with open(os.path.join(outputs_dir, 'metrics', 'test_metrics.json'), 'w') as f:
-        json.dump(test_metrics, f, indent=4)
-        
-    pd.DataFrame(test_metrics).T.to_csv(os.path.join(outputs_dir, 'metrics', 'test_metrics.csv'))
-    print("Saved test_metrics.json and test_metrics.csv.")
+        json.dump(final_test_report, f, indent=4)
+    print("Saved test_metrics.csv and test_metrics.json.")
 
-    # Create CSV for Tableau / Power BI dashboard creation
-    dashboard_records = []
-    for idx, fname in enumerate(filenames):
-        gt_np = targets[idx][0, 0].numpy()
-        pred_swin_np = swin_preds[idx][0, 0].numpy()
-        pred_base_np = baseline_preds[idx][0, 0].numpy()
-        
-        gt_change_pct = (gt_np.sum() / gt_np.size) * 100.0
-        swin_change_pct = (pred_swin_np.sum() / pred_swin_np.size) * 100.0
-        base_change_pct = (pred_base_np.sum() / pred_base_np.size) * 100.0
-        
-        # Calculate sample-level metrics for Swin
-        sample_metrics_swin = compute_metrics(swin_preds[idx], targets[idx])
-        sample_metrics_base = compute_metrics(baseline_preds[idx], targets[idx])
-        
-        # We will log Swin metrics primarily, or save separate lines per model to filter in Tableau!
-        # Let's save a clean flat structure that dashboards love:
-        dashboard_records.append({
-            'sample_id': fname,
-            'model_type': 'Swin-Transformer',
-            'change_percentage_ground_truth': gt_change_pct,
-            'change_percentage_prediction': swin_change_pct,
-            'precision': sample_metrics_swin['precision'],
-            'recall': sample_metrics_swin['recall'],
-            'f1': sample_metrics_swin['f1'],
-            'iou': sample_metrics_swin['iou'],
-            'dice': sample_metrics_swin['dice'],
-            'xai_overlap': swin_xai_overlaps[idx],
-            'xai_stability': swin_xai_stabilities[idx]
-        })
-        
-        dashboard_records.append({
-            'sample_id': fname,
-            'model_type': 'CNN-Baseline',
-            'change_percentage_ground_truth': gt_change_pct,
-            'change_percentage_prediction': base_change_pct,
-            'precision': sample_metrics_base['precision'],
-            'recall': sample_metrics_base['recall'],
-            'f1': sample_metrics_base['f1'],
-            'iou': sample_metrics_base['iou'],
-            'dice': sample_metrics_base['dice'],
-            'xai_overlap': baseline_xai_overlaps[idx],
-            'xai_stability': baseline_xai_stabilities[idx]
-        })
+    # Build comprehensive dashboard_data.csv with all sample-level fields required by Part 4
+    dashboard_rows = []
+    for idx, fname in enumerate(all_filenames):
+        gt = all_targets[idx]
+        gt_np = gt[0, 0].numpy()
+        true_change_px = int(gt_np.sum())
+        total_px = gt_np.size
+        true_change_pct = (true_change_px / total_px) * 100.0
 
-    df_dashboard = pd.DataFrame(dashboard_records)
-    dashboard_csv_path = os.path.join(outputs_dir, 'metrics', 'dashboard_data.csv')
-    df_dashboard.to_csv(dashboard_csv_path, index=False)
-    print(f"Saved dashboard data to {dashboard_csv_path}")
+        for m_key in model_keys:
+            pred = all_predictions[m_key][idx]
+            pred_np = pred[0, 0].numpy()
+            pred_change_px = int(pred_np.sum())
+            pred_change_pct = (pred_change_px / total_px) * 100.0
 
-    # Generate all academic / diagnostic plots
-    # 1-4. Loss and performance validation curves
-    with open(os.path.join(outputs_dir, 'metrics', 'history_baseline.json'), 'r') as f:
-        hist_base = json.load(f)
-    with open(os.path.join(outputs_dir, 'metrics', 'history_swin.json'), 'r') as f:
-        hist_swin = json.load(f)
-        
-    plot_training_curves(hist_base, hist_swin, os.path.join(outputs_dir, 'visualizations'))
-    
-    # 5. Bar comparison plot
-    plot_precision_recall_f1(metrics_base, metrics_swin, os.path.join(outputs_dir, 'visualizations'))
-    
-    # 6-8. Statistical distributions
-    plot_distributions(df_dashboard[df_dashboard['model_type'] == 'Swin-Transformer'], os.path.join(outputs_dir, 'visualizations'))
+            stats = compute_detailed_pixel_stats(pred, gt)
+            overlap = all_xai_overlaps[m_key][idx]
+            stability = all_xai_stabilities[m_key][idx]
+
+            dashboard_rows.append({
+                'sample_id': fname,
+                'model': model_labels[m_key],
+                'model_type': model_labels[m_key], # backwards compatibility
+                'image_name': fname,
+                'true_change_pixels': true_change_px,
+                'predicted_change_pixels': pred_change_px,
+                'true_change_percentage': true_change_pct,
+                'predicted_change_percentage': pred_change_pct,
+                'change_percentage_ground_truth': true_change_pct, # backwards compatibility
+                'change_percentage_prediction': pred_change_pct,   # backwards compatibility
+                'TP': stats['TP'],
+                'TN': stats['TN'],
+                'FP': stats['FP'],
+                'FN': stats['FN'],
+                'accuracy': stats['accuracy'],
+                'precision': stats['precision'],
+                'recall': stats['recall'],
+                'f1': stats['f1'],
+                'iou': stats['iou'],
+                'dice': stats['dice'],
+                'xai_overlap': overlap,
+                'xai_stability': stability
+            })
+
+    df_dashboard = pd.DataFrame(dashboard_rows)
+    master_dashboard_path1 = os.path.join(outputs_dir, 'dashboard_data.csv')
+    master_dashboard_path2 = os.path.join(outputs_dir, 'metrics', 'dashboard_data.csv')
+    df_dashboard.to_csv(master_dashboard_path1, index=False)
+    df_dashboard.to_csv(master_dashboard_path2, index=False)
+    print(f"Saved master dashboard data to {master_dashboard_path1} and {master_dashboard_path2}.")
+
+    # Generate InfoVis academic plots
+    histories = {}
+    hist_files = {
+        'Siamese CNN': 'history_baseline.json',
+        'Siamese U-Net': 'history_siamese_unet.json',
+        'Swin Transformer': 'history_swin.json',
+        'ChangeFormer': 'history_changeformer.json'
+    }
+    for m_label, h_file in hist_files.items():
+        h_path = os.path.join(outputs_dir, 'metrics', h_file)
+        if os.path.exists(h_path):
+            with open(h_path, 'r') as f:
+                histories[m_label] = json.load(f)
+
+    if len(histories) >= 2:
+        plot_training_curves(histories, os.path.join(outputs_dir, 'visualizations'))
+
+    metrics_for_plot = {
+        m_label: {
+            'precision': final_test_report[m_label]['Precision'],
+            'recall': final_test_report[m_label]['Recall'],
+            'f1': final_test_report[m_label]['F1']
+        }
+        for m_label in final_test_report
+    }
+    plot_precision_recall_f1(metrics_for_plot, os.path.join(outputs_dir, 'visualizations'))
+    plot_distributions(df_dashboard, os.path.join(outputs_dir, 'visualizations'))
+    print("Multi-model evaluation and visual asset generation completed successfully!")
 
 if __name__ == '__main__':
     run_evaluation()
